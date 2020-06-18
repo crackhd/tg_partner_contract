@@ -1,38 +1,40 @@
-pragma solidity ^0.4.16;
+pragma solidity ^0.6.10;
 pragma experimental ABIEncoderV2;
+
+// SPDX-License-Identifier: UNLICENSED
 
 contract Token {
 
-    /// @return total amount of tokens
-    function totalSupply() constant returns (uint256 supply) {}
+    /// returns total amount of tokens
+    function totalSupply() public virtual view returns (uint256 supply) {}
 
     /// @param _owner The address from which the balance will be retrieved
-    /// @return The balance
-    function balanceOf(address _owner) constant returns (uint256 balance) {}
+    /// returns The balance
+    function balanceOf(address _owner) public virtual view returns (uint256 balance) {}
 
     /// @notice send `_value` token to `_to` from `msg.sender`
     /// @param _to The address of the recipient
     /// @param _value The amount of token to be transferred
-    /// @return Whether the transfer was successful or not
-    function transfer(address _to, uint256 _value) returns (bool success) {}
+    /// returns Whether the transfer was successful or not
+    function transfer(address _to, uint256 _value) public virtual returns (bool success) {}
 
     /// @notice send `_value` token to `_to` from `_from` on the condition it is approved by `_from`
     /// @param _from The address of the sender
     /// @param _to The address of the recipient
     /// @param _value The amount of token to be transferred
-    /// @return Whether the transfer was successful or not
-    function transferFrom(address _from, address _to, uint256 _value) returns (bool success) {}
+    /// returns Whether the transfer was successful or not
+    function transferFrom(address _from, address _to, uint256 _value) public virtual returns (bool success) {}
 
     /// @notice `msg.sender` approves `_addr` to spend `_value` tokens
     /// @param _spender The address of the account able to transfer the tokens
     /// @param _value The amount of wei to be approved for transfer
-    /// @return Whether the approval was successful or not
-    function approve(address _spender, uint256 _value) returns (bool success) {}
+    /// returns Whether the approval was successful or not
+    function approve(address _spender, uint256 _value) public virtual returns (bool success) {}
 
     /// @param _owner The address of the account owning tokens
     /// @param _spender The address of the account able to transfer the tokens
-    /// @return Amount of remaining tokens allowed to spent
-    function allowance(address _owner, address _spender) constant returns (uint256 remaining) {}
+    /// returns Amount of remaining tokens allowed to spent
+    function allowance(address _owner, address _spender) public virtual view returns (uint256 remaining) {}
 
     event Transfer(address indexed _from, address indexed _to, uint256 _value);
     event Approval(address indexed _owner, address indexed _spender, uint256 _value);
@@ -49,7 +51,7 @@ contract StandardToken is Token {
                                                                     // amount of tokens user allowed to spend from his balance
                                                                     // to another user
 
-    function transfer(address _to, uint256 _value) returns (bool success) {
+    function transfer(address _to, uint256 _value) public override returns (bool success) {
         //Default assumes totalSupply can't be over max (2^256 - 1).
         //If your token leaves out totalSupply and can issue more tokens as time goes on, you need to check if it doesn't wrap.
         //Replace the if with this one instead.
@@ -62,7 +64,7 @@ contract StandardToken is Token {
         } else { return false; }
     }
 
-    function transferFrom(address _from, address _to, uint256 _value) returns (bool success) {
+    function transferFrom(address _from, address _to, uint256 _value) public override returns (bool success) {
         //same as above. Replace this line with the following if you want to protect against wrapping uints.
         //if (balances[_from] >= _value && allowed[_from][msg.sender] >= _value && balances[_to] + _value > balances[_to]) {
         if (balances[_from] >= _value && allowed[_from][msg.sender] >= _value && _value > 0) {
@@ -74,17 +76,17 @@ contract StandardToken is Token {
         } else { return false; }
     }
 
-    function balanceOf(address _owner) constant returns (uint256 balance) {
+    function balanceOf(address _owner) public override view returns (uint256 balance) {
         return balances[_owner];
     }
 
-    function approve(address _spender, uint256 _value) returns (bool success) {
+    function approve(address _spender, uint256 _value) public override returns (bool success) {
         allowed[msg.sender][_spender] = _value;
         emit Approval(msg.sender, _spender, _value);
         return true;
     }
 
-    function allowance(address _owner, address _spender) constant returns (uint256 remaining) {
+    function allowance(address _owner, address _spender) public override view returns (uint256 remaining) {
       return allowed[_owner][_spender];
     }
 }
@@ -132,13 +134,6 @@ contract RewardToken is StandardToken {
         uint256 userEtherCost;                          // gas cost per request of user (spent)
     }
 
-    // Rule defines amount of reward starting from some number of points
-    struct Rule {
-        string group;                               // group name (if needed) which the rule is effective for
-        uint256 threshold;                          // minimal amount of points for rule to be applied
-        uint256 rewardForPoint;                     // how much tokens to give as reward per point
-    }
-
     address public ceo;                             // owner of contract, has the abillity to withdraw ether from the contract (if needed),
                                                     // modify array of authorized bots
                                                     // and update list of authorized groups
@@ -161,8 +156,11 @@ contract RewardToken is StandardToken {
 
     uint256 public duration;                            // duration of a challenge, as set by the ceo
 
-    Rule[] public rules;                                // rewarding rules, as set by CEO
-                                                        // this array MUST be sorted from defining higher to lower point threshold values
+    uint256[] public rules;                             // rewarding rules, as set by CEO
+                                                        // a sequence of threshold+rewardForPoint pairs used to calculate bonus;
+                                                        // the array MUST be sorted from higher to lower point threshold values
+
+    uint public numberOfRules;                          // number of effective rules (pairs in rules array)
 
     uint256 public weiPerToken;                         // how much ether we give or take for a token, as set by CEO
 
@@ -194,6 +192,12 @@ contract RewardToken is StandardToken {
     // CHANGE THESE VALUES FOR YOUR TOKEN
     //
 
+    // New challenge is created
+    event ChallengeRequest(uint256 indexed _id, address indexed _user, string _group);
+
+    // Challenge status was updated
+    event ChallengeUpdate(uint256 indexed _id, ChallengeStatus indexed _status, uint256 _reward);
+
     //make sure this function name matches the contract name above. So if you're token is called TutorialToken, make sure the //contract name above is also TutorialToken instead of ERC20Token
 
     constructor(uint256 _weiPerToken, uint256 _minBankForChallenge, uint256 _rewardForPoint, uint256 _duration, uint256 _requestTimeout, bool _serviceCostsEnabled) public payable
@@ -208,11 +212,9 @@ contract RewardToken is StandardToken {
         serviceCostsEnabled = _serviceCostsEnabled;
 
         // Iniital rule
-        rules.push(Rule({
-            group: "",
-            threshold: 0,
-            rewardForPoint: _rewardForPoint
-        }));
+        rules.push(0);
+        rules.push(_rewardForPoint);
+        numberOfRules = 1;
 
         name = "Reward Token";                  // Set the name for display purposes
         decimals = 2;                           // Amount of decimals for display purposes
@@ -221,18 +223,25 @@ contract RewardToken is StandardToken {
         updateSupplyAndBank();
     }
 
-    /// @return total amount of tokens (directly tied to the contract balance)
-    function totalSupply() constant returns (uint256 supply) {
+    /// returns total amount of tokens (directly tied to the contract balance)
+    function totalSupply() public override view returns (uint256 supply) {
         return address(this).balance / weiPerToken;
     }
 
-    /// @return total amount of tokens which are supported by ether, but do not have any owner (thus usable for new rewards)
-    function totalBank() constant returns (uint256 bank) {
-        return totalSupply() - totalOwnedTokens;
+    /// returns total amount of tokens which are supported by ether, but do not have any owner (thus usable for new rewards)
+    function totalBank() public view returns (uint256 bank) {
+        uint256 all = totalSupply();
+        if (all <= totalOwnedTokens) {
+            return 0;
+        }
+        return all - totalOwnedTokens;
     }
 
     // if ether is sent to this address, accept it - increases totalSupply, remembering user donation
-    function () public payable {
+    fallback() external payable {
+        updateSupplyAndBank();
+    }
+    receive() external payable {
         updateSupplyAndBank();
     }
 
@@ -241,19 +250,7 @@ contract RewardToken is StandardToken {
         updateSupplyAndBank();
     }
 
-    /* Approves and then calls the receiving contract */
-    function approveAndCall(address _spender, uint256 _value, bytes _extraData) returns (bool success) {
-        allowed[msg.sender][_spender] = _value;
-        emit Approval(msg.sender, _spender, _value);
-
-        //call the receiveApproval function on the contract you want to be notified. This crafts the function signature manually so one doesn't have to include a contract in here just for this.
-        //receiveApproval(address _from, uint256 _value, address _tokenContract, bytes _extraData)
-        //it is assumed that when does this that the call *should* succeed, otherwise one would use vanilla approve instead.
-        if(!_spender.call(bytes4(bytes32(sha3("receiveApproval(address,uint256,address,bytes)"))), msg.sender, _value, this, _extraData)) { revert(); }
-        return true;
-    }
-
-    function newChallenge(string group, uint32 resource, uint32 flags) public payable  {
+    function newChallenge(string calldata group, uint32 resource, uint32 flags) public payable  {
         if (totalBank() < minBankForChallenge) {
             revert("Low on supply for new challenge (safety check)");
         }
@@ -294,12 +291,6 @@ contract RewardToken is StandardToken {
         challenges[numChallenges - 1].userEtherCost = tx.gasprice + 21000;
     }
 
-    // New challenge is created
-    event ChallengeRequest(uint256 indexed _id, address indexed _user, string _group);
-
-    // Challenge status was updated
-    event ChallengeUpdate(uint256 indexed _id, ChallengeStatus indexed _status, uint256 _reward);
-
     // Sell converts user token(s) to ether and sends ether to user
     // This will decreatse both totalBank() and totalSupply()
     // It will subtract the amount of commission for service (gas price from our side)
@@ -314,9 +305,6 @@ contract RewardToken is StandardToken {
         if (requestTokens > balances[msg.sender]) {
             revert("You do not have enough tokens on your balance");
         }
-        if (msg.value > 0) {
-            revert("Do not send ether with this call");
-        }
 
         uint256 requestEther = requestTokens * weiPerToken;
 
@@ -329,8 +317,12 @@ contract RewardToken is StandardToken {
         }
         etherCostService[msg.sender] = 0;
 
-        requestEther += etherUserCompensation[msg.sender];
-        etherUserCompensation[msg.sender] = 0;
+        // Only add compensations when possible
+        uint256 compensationIncluded = etherUserCompensation[msg.sender];
+        if(requestEther + compensationIncluded <= address(this).balance) {
+            requestEther += compensationIncluded;
+            etherUserCompensation[msg.sender] = 0;
+        }
 
         if (requestEther < 0) {
             revert("The balance is too low to add the service costs as commission (compensations excluded)");
@@ -356,7 +348,7 @@ contract RewardToken is StandardToken {
     }
 
     // BOT ONLY: Marks challenge failed with a message
-    function botFailChallenge(uint256 _id, string error) public payable {
+    function botFailChallenge(uint256 _id, string calldata error) public payable {
         uint256 startGas = gasleft();
 
         if (!bots[msg.sender]) {
@@ -370,6 +362,7 @@ contract RewardToken is StandardToken {
         }
 
         challenges[_id].data.status = ChallengeStatus.ERROR;
+        challenges[_id].data.error = error;
         challenges[_id].data.finishedAt = now;
 
         address user = challenges[_id].user;
@@ -390,11 +383,12 @@ contract RewardToken is StandardToken {
             revert();
         }
 
-        if (challenges[_id].data.status != ChallengeStatus.NEW) {
-            revert();
+        if(challenges[_id].data.status != ChallengeStatus.NEW) {
+            revert("You can only confirm NEW challenges");
         }
 
         if(!failChallengeIfTimeout(_id)) {
+
             challenges[_id].data.status = ChallengeStatus.CONFIRMED;
             challenges[_id].data.pointsBefore = pointsBefore;
             challenges[_id].data.confirmedAt = now;
@@ -414,28 +408,35 @@ contract RewardToken is StandardToken {
             revert();
         }
 
-        if (challenges[_id].data.status != ChallengeStatus.CONFIRMED) {
-            revert();
+        if(challenges[_id].data.status != ChallengeStatus.CONFIRMED) {
+            revert("You can only finish CONFIRMED challenges");
         }
 
         if(!failChallengeIfTimeout(_id)) {
-            address user = challenges[_id].user;
 
             challenges[_id].data.status = ChallengeStatus.FINISHED;
             challenges[_id].data.pointsAfter = pointsAfter;
             challenges[_id].data.finishedAt = now;
 
             uint256 points = challenges[_id].data.pointsAfter - challenges[_id].data.pointsBefore;
-            uint256 tokenAmount = rewardForPoints(points, challenges[_id].group);
+            if(points < 0) {
+                challenges[_id].data.error = "Provided data is incorrect. PointsBefore was higher than the PointsAfter sent with botFinishChallenge";
+                challenges[_id].data.status = ChallengeStatus.ERROR;
+                emit ChallengeUpdate(_id, ChallengeStatus.ERROR, 0);
+            } else {
+                uint256 tokenAmount = rewardForPoints(points);
 
-            challenges[_id].data.reward = tokenAmount;
+                challenges[_id].data.reward = tokenAmount;
 
-            balances[user] += tokenAmount;
-            totalOwnedTokens += tokenAmount;
+                address user = challenges[_id].user;
+                balances[user] += tokenAmount;
+                totalOwnedTokens += tokenAmount;
 
-            userChallenge[challenges[_id].user] = 0;
-            emit ChallengeUpdate(_id, ChallengeStatus.FINISHED, tokenAmount);
-            emit Transfer(address(this), user, tokenAmount);
+                userChallenge[user] = 0;
+
+                emit ChallengeUpdate(_id, ChallengeStatus.FINISHED, tokenAmount);
+                emit Transfer(address(this), user, tokenAmount);
+            }
         }
 
         updateSupplyAndBank();
@@ -458,24 +459,25 @@ contract RewardToken is StandardToken {
     }
 
     // CEO ONLY: Updates the rules of reward system
-    function ceoUpdateRules(Rule[] _rules) public payable {
+    function ceoUpdateRules(uint256[] calldata _rules) public payable {
         if (msg.sender != ceo) {
             revert();
         }
 
-        for (uint i = 0; i < _rules.length; i++) {
-          rules[i] = _rules[i];
-        }
-
-        for (i = _rules.length; i < rules.length; i++) {
-          delete rules[i];
-        }
+        rules = _rules;
+        numberOfRules = _rules.length / 2;
 
         updateSupplyAndBank();
     }
 
+    // Returns the threshold and reward for specific rule by non-array index (by rule number)
+    function getRule(uint256 _ruleNumber) public view returns (uint256 threshold, uint256 rewardForPoint) {
+        uint256 i = _ruleNumber * 2;
+        return (rules[i], rules[i + 1]);
+    }
+
     // CEO ONLY: remove or add authorization of bots
-    function ceoAuthBots(bool auth, address[] _bots) public payable  {
+    function ceoAuthBots(bool auth, address[] calldata _bots) public payable  {
         if (msg.sender != ceo) {
             revert();
         }
@@ -502,21 +504,19 @@ contract RewardToken is StandardToken {
     }
 
     // Returns true if strings are equal (unsafe!)
-    function compareStrings (string memory a, string memory b) public view returns (bool) {
+    function compareStrings (string memory a, string memory b) public pure returns (bool) {
         return (keccak256(abi.encodePacked((a))) == keccak256(abi.encodePacked((b))) );
     }
 
     // Calculates reward according to the rules set by CEO
-    function rewardForPoints(uint256 points, string group) public constant returns (uint256) {
+    function rewardForPoints(uint256 points) public view returns (uint256) {
         uint256 result = 0;
 
-        for (uint i = 0; i < rules.length; i++) {
-            if (points > rules[i].threshold) {
-                if (bytes(rules[i].group).length == 0 || compareStrings(group, rules[i].group)) {
-                    uint256 pointsAbove = (points - rules[i].threshold);
-                    result += pointsAbove * rules[i].rewardForPoint;
-                    points -= pointsAbove;
-                }
+        for (uint i = 0; i < rules.length; i += 2) {
+            if (points > rules[i]) {
+                uint256 pointsAbove = (points - rules[i]);
+                result += pointsAbove * rules[i+1];
+                points -= pointsAbove;
             }
         }
 
@@ -548,7 +548,7 @@ contract RewardToken is StandardToken {
         }
 
         if (challenges[_id].data.status == ChallengeStatus.CONFIRMED) {
-            if (now >= (challenges[_id].data.confirmedAt + requestTimeout)) {
+            if (now >= (challenges[_id].data.confirmedAt + duration + requestTimeout)) {
                 onChallengeTimeout(_id);
                 return true;
             }
@@ -559,11 +559,13 @@ contract RewardToken is StandardToken {
 
     // Saves the cost of current transaction as future commission in the payout to creator of the challenge
     function saveChallengeServiceCosts(uint256 _id, uint256 startGas) private {
+
+        uint256 gasUsed = startGas - gasleft();
+        uint256 commission = (gasUsed * tx.gasprice) + 21000 + msg.value;
+
         challenges[_id].data.etherCostService += commission;
 
         if(serviceCostsEnabled) {
-            uint256 gasUsed = startGas - gasleft();
-            uint256 commission = (gasUsed * tx.gasprice) + 21000 + msg.value;
             etherCostService[challenges[_id].user] += commission;
         } else {
             etherCostService[challenges[_id].user] = 0;
@@ -571,7 +573,7 @@ contract RewardToken is StandardToken {
     }
 
     // Checks whether user has an ongoing challenge request at the moment
-    function hasActiveChallenge(address user) constant public returns (bool) {
+    function hasActiveChallenge(address user) public view returns (bool) {
         uint256 _id = userChallenge[user];
         return challenges[_id].user == user && (
             challenges[_id].data.status == ChallengeStatus.NEW ||
