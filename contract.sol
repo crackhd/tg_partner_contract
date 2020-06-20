@@ -1,7 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0
 pragma solidity ^0.6.10;
 pragma experimental ABIEncoderV2;
-
-// SPDX-License-Identifier: UNLICENSED
 
 contract Token {
 
@@ -89,11 +88,18 @@ contract StandardToken is Token {
     function allowance(address _owner, address _spender) public override view returns (uint256 remaining) {
       return allowed[_owner][_spender];
     }
+
+    // Returns true if strings are equal (unsafe!)
+    function compareStrings (string memory a, string memory b) public pure returns (bool) {
+        return (keccak256(abi.encodePacked((a))) == keccak256(abi.encodePacked((b))) );
+    }
 }
 
 
 //name this contract whatever you'd like
 contract RewardToken is StandardToken {
+
+    uint8 constant FLAG_ABUSE = 4;
 
     // Challenge status is a enum
     enum ChallengeStatus {
@@ -116,7 +122,7 @@ contract RewardToken is StandardToken {
         string error;                                   // in case of an error, hold description
         uint256 reward;                                 // amount of tokens assigned to sender as a result of the challenge
 
-        uint256 etherCostService;                       // approximate total gas charges BOTS spent on this request
+        uint256 serviceCost;                       // approximate total gas charges BOTS spent on this request
     }
 
     // Challenge is a request to bot(s) from a user
@@ -125,12 +131,12 @@ contract RewardToken is StandardToken {
         address user;                                   // request owner
         uint256 createdAt;                              // timestamp
 
-        uint32 flags;                                   // custom flags (reserved)
         string group;                                   // group designates the target of the challenge
         uint32 resource;                                // specific request of challenge (part of the group)
 
         ChallengeData data;                             // struct with dynamic data of the challenge
 
+        uint8 flags;                                    // special state flags
         uint256 userEtherCost;                          // gas cost per request of user (spent)
     }
 
@@ -167,11 +173,15 @@ contract RewardToken is StandardToken {
     uint256 public requestTimeout;                      // maximum time before challenge is failed without confirmation or after confirmation
                                                         // and a refund is available, as set by CEO
 
-    mapping (address => uint256) public etherCostService;      // for every user, keep costs from service side before the withdrawal (sell)
+    mapping (address => uint256) public serviceCost;    // for every user, keep storing aggregated amount of service costs
+                                                        // to be witheld in the next Sell() transaction
 
     bool public serviceCostsEnabled;                    // determines whether users will be charged for gas costs of service bots, as set by CEO
 
-    mapping (address => uint256) public etherUserCompensation;     // for ever user, if challenge request has failed, we will refund gasprice cost if requested
+    mapping (address => uint256) public compensations;  // for every user, keep storing aggregated amount
+                                                        // of gas price they spent on their transactions,
+                                                        // specifically the part of which to be refunded to them
+                                                        // on the next sell() as compensation for service outage
 
     /* Public variables of the token */
 
@@ -200,10 +210,10 @@ contract RewardToken is StandardToken {
 
     //make sure this function name matches the contract name above. So if you're token is called TutorialToken, make sure the //contract name above is also TutorialToken instead of ERC20Token
 
-    constructor(uint256 _weiPerToken, uint256 _minBankForChallenge, uint256 _rewardForPoint, uint256 _duration, uint256 _requestTimeout, bool _serviceCostsEnabled) public payable
+    constructor(uint256 _weiPerToken, uint256 _minBankForChallenge, uint256 _rewardForPoint, uint256 _duration, uint256 _requestTimeout, bool _serviceCostsEnabled)
+        public payable
     {
         ceo = msg.sender;                       // hire CEO
-        donations[msg.sender] = msg.value;      // ceo donation excl. gas cost
 
         weiPerToken = _weiPerToken;
         minBankForChallenge = _minBankForChallenge;
@@ -220,7 +230,7 @@ contract RewardToken is StandardToken {
         decimals = 2;                           // Amount of decimals for display purposes
         symbol = "RWRD";                        // Set the symbol for display purposes
 
-        updateSupplyAndBank();
+        rememberDonation();
     }
 
     /// returns total amount of tokens (directly tied to the contract balance)
@@ -237,20 +247,99 @@ contract RewardToken is StandardToken {
         return all - totalOwnedTokens;
     }
 
+    // Returns the threshold and reward for specific rule by non-array index (by rule number)
+    function getRule(uint256 _ruleNumber) public view returns (uint256 threshold, uint256 rewardForPoint) {
+        uint256 i = _ruleNumber * 2;
+        return (rules[i], rules[i + 1]);
+    }
+
     // if ether is sent to this address, accept it - increases totalSupply, remembering user donation
     fallback() external payable {
-        updateSupplyAndBank();
+        rememberDonation();
     }
     receive() external payable {
-        updateSupplyAndBank();
+        rememberDonation();
     }
 
-    // Equal to send money to the contract directly - increases totalSupply, remembering user donation
-    function deposit() public payable {
-        updateSupplyAndBank();
+    // Restricts function to only work if sender is service bot, authorized by CEO to
+    // provide data and updates for challenge data
+    modifier onlyForBots()
+    {
+        require(
+            bots[msg.sender],
+            "Sender not authorized (must be bot)."
+        );
+        // Do not forget the "_;"! It will
+        // be replaced by the actual function
+        // body when the modifier is used.
+        _;
     }
 
-    function newChallenge(string calldata group, uint32 resource, uint32 flags) public payable  {
+    // Restricts function to only work if sender is contract CEO
+    modifier onlyForCEO()
+    {
+        require(
+            msg.sender == ceo,
+            "Sender not authorized (must be CEO)."
+        );
+        // Do not forget the "_;"! It will
+        // be replaced by the actual function
+        // body when the modifier is used.
+        _;
+    }
+
+    // Restricts function to only work if provided challenge has an active status
+    modifier onlyForActiveChallenge(uint256 _id)
+    {
+        assert(_id < numChallenges);
+        require(
+            challenges[_id].data.status == ChallengeStatus.NEW || challenges[_id].data.status == ChallengeStatus.CONFIRMED,
+            "Invalid challenge status (must be NEW or CONFIRMED)"
+        );
+        // Do not forget the "_;"! It will
+        // be replaced by the actual function
+        // body when the modifier is used.
+        _;
+    }
+
+    // Restricts function to only work if provided challenge has status NEW (unconfirmed)
+    modifier onlyForNewChallenge(uint256 _id)
+    {
+        require(
+            challenges[_id].data.status == ChallengeStatus.NEW,
+            "Invalid challenge status (must be NEW)"
+        );
+        // Do not forget the "_;"! It will
+        // be replaced by the actual function
+        // body when the modifier is used.
+        _;
+    }
+
+    // Restricts function to only work if provided challenge has status CONFIRMED
+    // and can finished at the current time
+    modifier onlyForFinishingChallenge(uint256 _id)
+    {
+        require(
+            challenges[_id].data.status == ChallengeStatus.CONFIRMED,
+            "Invalid challenge status (must be CONFIRMED)"
+        );
+
+        require(
+            challenges[_id].data.confirmedAt + duration <= now,
+            "The challenge cannot be finished yet (check duration)"
+        );
+
+        // Do not forget the "_;"! It will
+        // be replaced by the actual function
+        // body when the modifier is used.
+        _;
+    }
+
+    function newChallenge(string calldata group, uint32 resource, uint8 flags)
+        public payable
+    {
+        uint256 startGas = gasleft();
+
         if (totalBank() < minBankForChallenge) {
             revert("Low on supply for new challenge (safety check)");
         }
@@ -261,8 +350,11 @@ contract RewardToken is StandardToken {
             revert("Invalid challenge request");
         }
 
-        challenges[numChallenges] = Challenge({
-            id: numChallenges,
+        uint256 id = numChallenges;
+        numChallenges++;
+
+        challenges[id] = Challenge({
+            id: id,
             user: msg.sender,
             createdAt: now,
             flags: flags,
@@ -276,52 +368,47 @@ contract RewardToken is StandardToken {
                 pointsAfter: 0,
                 error: "",
                 reward: 0,
-                etherCostService: 0
+                serviceCost: 0
             }),
             userEtherCost: 0
         });
 
-        userChallenge[msg.sender] = numChallenges;
-        emit ChallengeRequest(numChallenges, msg.sender, group);
+        userChallenge[msg.sender] = id;
+        emit ChallengeRequest(id, msg.sender, group);
 
-        numChallenges++;
-
-        updateSupplyAndBank();
-
-        challenges[numChallenges - 1].userEtherCost = tx.gasprice + 21000;
+        rememberDonation();
+        addUserCostsChallenge(id, startGas);
     }
 
     // Sell converts user token(s) to ether and sends ether to user
     // This will decreatse both totalBank() and totalSupply()
     // It will subtract the amount of commission for service (gas price from our side)
-    // It will add the amount of compensation
+    // It will add the amount of compensations
     // If user has an ongoing challenge, it will be checked for timeout
-    // (timeout compensation will be included into transfer of the function)
+    // (timeout compensations will be included into transfer of the function)
     // Allowed amounts are 0 and higher.
     function sell(uint256 requestTokens) public {
-        if(requestTokens < 0) {
-            revert("Invalid amount of tokens");
-        }
         if (requestTokens > balances[msg.sender]) {
             revert("You do not have enough tokens on your balance");
         }
 
-        uint256 requestEther = requestTokens * weiPerToken;
+        int256 requestEther = int256(requestTokens * weiPerToken);
 
         if (hasActiveChallenge(msg.sender)) {
             failChallengeIfTimeout(userChallenge[msg.sender]);
         }
 
         if(serviceCostsEnabled) {
-            requestEther -= etherCostService[msg.sender];
+            requestEther -= int256(serviceCost[msg.sender]);
         }
-        etherCostService[msg.sender] = 0;
+        serviceCost[msg.sender] = 0;
 
         // Only add compensations when possible
-        uint256 compensationIncluded = etherUserCompensation[msg.sender];
-        if(requestEther + compensationIncluded <= address(this).balance) {
+        int256 compensationIncluded = int256(compensations[msg.sender]);
+        int256 maxEther = int256(address(this).balance);
+        if(requestEther + compensationIncluded <= maxEther) {
             requestEther += compensationIncluded;
-            etherUserCompensation[msg.sender] = 0;
+            compensations[msg.sender] = 0;
         }
 
         if (requestEther < 0) {
@@ -331,14 +418,12 @@ contract RewardToken is StandardToken {
         balances[msg.sender] -= requestTokens;
         totalOwnedTokens -= requestTokens;
 
-        msg.sender.transfer(requestEther);
+        msg.sender.transfer(uint256(requestEther));
         emit Transfer(msg.sender, address(this), requestTokens);
     }
 
     // Any user can buy theirself tokens in exchange to ether
     function buy() public payable {
-        donations[msg.sender] -= msg.value;
-
         uint256 tokens = msg.value / weiPerToken;
 
         balances[msg.sender] += tokens;
@@ -347,19 +432,30 @@ contract RewardToken is StandardToken {
         emit Transfer(address(this), msg.sender, tokens);
     }
 
-    // BOT ONLY: Marks challenge failed with a message
-    function botFailChallenge(uint256 _id, string calldata error) public payable {
-        uint256 startGas = gasleft();
+    // Calculates reward according to the rules set by CEO
+    function rewardForPoints(uint256 points)
+        public view returns (uint256)
+    {
+        uint256 result = 0;
 
-        if (!bots[msg.sender]) {
-            revert();
-        }
-
-        if (challenges[_id].data.status != ChallengeStatus.NEW) {
-            if (challenges[_id].data.status != ChallengeStatus.CONFIRMED) {
-                revert();
+        for (uint i = 0; i < rules.length; i += 2) {
+            if (points > rules[i]) {
+                uint256 pointsAbove = (points - rules[i]);
+                result += pointsAbove * rules[i+1];
+                points -= pointsAbove;
             }
         }
+
+        return result + points;
+    }
+
+    // BOT ONLY: Marks challenge failed with a message.
+    // abuse: set to true to mark actions of a user as suspicious or willingfuly incorrect
+    // on this challenge (they won't get gas compensation)
+    function botFailChallenge(uint256 _id, string calldata error, bool abuse)
+        public payable onlyForBots() onlyForActiveChallenge(_id)
+    {
+        uint256 startGas = gasleft();
 
         challenges[_id].data.status = ChallengeStatus.ERROR;
         challenges[_id].data.error = error;
@@ -367,25 +463,24 @@ contract RewardToken is StandardToken {
 
         address user = challenges[_id].user;
         userChallenge[user] = 0;
-        etherUserCompensation[user] += challenges[_id].userEtherCost;
+
+        if (!abuse) {
+            compensations[user] += challenges[_id].userEtherCost;
+        } else {
+            challenges[_id].flags |= FLAG_ABUSE;
+        }
 
         emit ChallengeUpdate(_id, ChallengeStatus.ERROR, 0);
 
-        updateSupplyAndBank();
-        saveChallengeServiceCosts(_id, startGas);
+        rememberDonation();
+        addServiceCostsChallenge(_id, startGas);
     }
 
     // BOT ONLY: Marks challenge as started (confirmed)
-    function botConfirmChallenge(uint256 _id, uint256 pointsBefore) public payable {
+    function botConfirmChallenge(uint256 _id, uint256 pointsBefore)
+        public payable onlyForBots() onlyForNewChallenge(_id)
+    {
         uint256 startGas = gasleft();
-
-        if (!bots[msg.sender]) {
-            revert();
-        }
-
-        if(challenges[_id].data.status != ChallengeStatus.NEW) {
-            revert("You can only confirm NEW challenges");
-        }
 
         if(!failChallengeIfTimeout(_id)) {
 
@@ -396,21 +491,15 @@ contract RewardToken is StandardToken {
             emit ChallengeUpdate(_id, ChallengeStatus.CONFIRMED, 0);
         }
 
-        updateSupplyAndBank();
-        saveChallengeServiceCosts(_id, startGas);
+        rememberDonation();
+        addServiceCostsChallenge(_id, startGas);
     }
 
     // BOT ONLY: Marks challenge as finished (done) and triggers reward for user
-    function botFinishChallenge(uint256 _id, uint256 pointsAfter) public payable {
+    function botFinishChallenge(uint256 _id, uint256 pointsAfter)
+        public payable onlyForBots() onlyForFinishingChallenge(_id)
+    {
         uint256 startGas = gasleft();
-
-        if (!bots[msg.sender]) {
-            revert();
-        }
-
-        if(challenges[_id].data.status != ChallengeStatus.CONFIRMED) {
-            revert("You can only finish CONFIRMED challenges");
-        }
 
         if(!failChallengeIfTimeout(_id)) {
 
@@ -439,99 +528,80 @@ contract RewardToken is StandardToken {
             }
         }
 
-        updateSupplyAndBank();
-        saveChallengeServiceCosts(_id, startGas);
+        rememberDonation();
+        addServiceCostsChallenge(_id, startGas);
     }
 
     // CEO ONLY: set restrictions and rewards
-    function ceoUpdate(uint256 _minBankForChallenge, uint256 _duration, uint256 _weiPerToken, uint256 _requestTimeout, bool _serviceCostsEnabled) public payable  {
-        if (msg.sender != ceo) {
-            revert();
-        }
-
+    function ceoUpdate(uint256 _minBankForChallenge, uint256 _duration, uint256 _weiPerToken, uint256 _requestTimeout, bool _serviceCostsEnabled)
+        public payable onlyForCEO()
+    {
         minBankForChallenge = _minBankForChallenge;
         duration = _duration;
         weiPerToken = _weiPerToken;
         requestTimeout = _requestTimeout;
         serviceCostsEnabled = _serviceCostsEnabled;
 
-        updateSupplyAndBank();
+        rememberDonation();
     }
 
     // CEO ONLY: Updates the rules of reward system
-    function ceoUpdateRules(uint256[] calldata _rules) public payable {
-        if (msg.sender != ceo) {
-            revert();
-        }
-
+    function ceoUpdateRules(uint256[] calldata _rules)
+        public payable onlyForCEO()
+    {
         rules = _rules;
         numberOfRules = _rules.length / 2;
 
-        updateSupplyAndBank();
-    }
-
-    // Returns the threshold and reward for specific rule by non-array index (by rule number)
-    function getRule(uint256 _ruleNumber) public view returns (uint256 threshold, uint256 rewardForPoint) {
-        uint256 i = _ruleNumber * 2;
-        return (rules[i], rules[i + 1]);
+        rememberDonation();
     }
 
     // CEO ONLY: remove or add authorization of bots
-    function ceoAuthBots(bool auth, address[] calldata _bots) public payable  {
-        if (msg.sender != ceo) {
-            revert();
-        }
-
+    function ceoAuthBots(bool auth, address[] calldata _bots)
+        public payable onlyForCEO()
+    {
         for (uint i = 0; i < _bots.length; i++) {
             bots[_bots[i]] = auth;
         }
 
-        updateSupplyAndBank();
+        rememberDonation();
     }
 
     // CEO ONLY: moves tokens to user's balance
-    function ceoRewardFromBank(address user, uint256 amountTokens) public payable {
-        if (msg.sender != ceo) {
-            revert();
-        }
-
+    function ceoRewardFromBank(address user, uint256 amountTokens)
+        public payable onlyForCEO()
+    {
         balances[user] += amountTokens;
         totalOwnedTokens += amountTokens;
 
-        emit Transfer(address(this), user, amountTokens);
-
-        updateSupplyAndBank();
-    }
-
-    // Returns true if strings are equal (unsafe!)
-    function compareStrings (string memory a, string memory b) public pure returns (bool) {
-        return (keccak256(abi.encodePacked((a))) == keccak256(abi.encodePacked((b))) );
-    }
-
-    // Calculates reward according to the rules set by CEO
-    function rewardForPoints(uint256 points) public view returns (uint256) {
-        uint256 result = 0;
-
-        for (uint i = 0; i < rules.length; i += 2) {
-            if (points > rules[i]) {
-                uint256 pointsAbove = (points - rules[i]);
-                result += pointsAbove * rules[i+1];
-                points -= pointsAbove;
-            }
+        if (totalOwnedTokens > totalSupply()) {
+            revert("Not enough bank for provided amount");
         }
 
-        return result + points;
+        emit Transfer(address(this), user, amountTokens);
+
+        rememberDonation();
+    }
+
+    // Checks whether user has an ongoing challenge request at the moment
+    function hasActiveChallenge(address user) public view returns (bool) {
+        uint256 _id = userChallenge[user];
+        return challenges[_id].user == user && (
+            challenges[_id].data.status == ChallengeStatus.NEW ||
+            challenges[_id].data.status == ChallengeStatus.CONFIRMED
+        );
     }
 
     // Mark challenge as timed out and emits event
-    function onChallengeTimeout(uint256 _id) private {
+    function onChallengeTimeout(uint256 _id)
+        private onlyForActiveChallenge(_id)
+    {
         challenges[_id].data.status = ChallengeStatus.TIMEOUT;
 
         address user = challenges[_id].user;
 
         userChallenge[user] = 0;
 
-        etherUserCompensation[user] += challenges[_id].userEtherCost;
+        compensations[user] += challenges[_id].userEtherCost;
 
         challenges[_id].data.finishedAt = now;
 
@@ -539,7 +609,9 @@ contract RewardToken is StandardToken {
     }
 
     // Checks if challenge has timed out and fails it if so. Returns true if challenge has timed out
-    function failChallengeIfTimeout(uint256 _id) private returns (bool) {
+    function failChallengeIfTimeout(uint256 _id)
+        private returns (bool)
+    {
         if (challenges[_id].data.status == ChallengeStatus.NEW) {
             if (now >= (challenges[_id].createdAt + requestTimeout)) {
                 onChallengeTimeout(_id);
@@ -558,31 +630,42 @@ contract RewardToken is StandardToken {
     }
 
     // Saves the cost of current transaction as future commission in the payout to creator of the challenge
-    function saveChallengeServiceCosts(uint256 _id, uint256 startGas) private {
-
+    function addServiceCostsChallenge(uint256 _id, uint256 startGas)
+        private onlyForBots()
+    {
         uint256 gasUsed = startGas - gasleft();
-        uint256 commission = (gasUsed * tx.gasprice) + 21000 + msg.value;
+        uint256 commission = (gasUsed + 21000) * tx.gasprice + msg.value;
 
-        challenges[_id].data.etherCostService += commission;
+        challenges[_id].data.serviceCost += commission;
+
+        address user = challenges[_id].user;
 
         if(serviceCostsEnabled) {
-            etherCostService[challenges[_id].user] += commission;
+            serviceCost[user] += commission;
         } else {
-            etherCostService[challenges[_id].user] = 0;
+            serviceCost[user] = 0;
         }
     }
 
-    // Checks whether user has an ongoing challenge request at the moment
-    function hasActiveChallenge(address user) public view returns (bool) {
-        uint256 _id = userChallenge[user];
-        return challenges[_id].user == user && (
-            challenges[_id].data.status == ChallengeStatus.NEW ||
-            challenges[_id].data.status == ChallengeStatus.CONFIRMED
-        );
+    // Saves the cost of current transaction as future compensations in the payout to challenge creator
+    // (userEtherCost applied only in case of challenge failure)
+    // TODO: tx.gasprice must be limited for our budget safety to some reasonable value
+    function addUserCostsChallenge(uint256 _id, uint256 startGas)
+        private onlyForActiveChallenge(_id)
+    {
+        uint256 gasUsed = startGas - gasleft();
+        uint256 txCosts = (gasUsed + 21000) * tx.gasprice + msg.value;
+
+        challenges[_id].userEtherCost += txCosts;
     }
 
-    // Saves value of current transaction as new bamk money (if any)
-    function updateSupplyAndBank() private {
-        donations[msg.sender] += msg.value;
+    // Saves value of current transaction to record of donations by the sender.
+    // If sender is an authorized bot, donations are assigned to CEO's record
+    function rememberDonation() private {
+        if(bots[msg.sender]) {
+            donations[ceo] += msg.value;
+        } else {
+            donations[msg.sender] += msg.value;
+        }
     }
 }
