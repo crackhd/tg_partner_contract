@@ -96,7 +96,6 @@ contract StandardToken is Token {
 }
 
 
-//name this contract whatever you'd like
 contract RewardToken is StandardToken {
 
     uint8 constant FLAG_ABUSE = 4;
@@ -107,8 +106,30 @@ contract RewardToken is StandardToken {
         NEW,            // An initial status for created challenge
         CONFIRMED,      // Challenge has been confirmed by bot as in progress
         FINISHED,       // Challenge has been finished by bot
-        ERROR,          // Challenge resulted into an error and is aborted
+        ERROR,          // Challenge resulted into an error and is cancelled
         TIMEOUT         // challenge request timed out
+                        // (some challenges will never update under certain circumstances,
+                        // so the TIMEOUT the challenge status CONFIRMED is unreliable
+                        // without timeout check to detetct if it needs to be set to TIMEOUT
+    }
+
+    // Challenge is a request from user to time-limited service provided by bots
+    // When bot confirms or finishes challenge, user score is reported
+    // which is used to calculate reward in tokens that is immediatelly "transferred from the
+    // bank to user's balance"
+    struct Challenge {
+        uint256 id;                                     // unique identifier of the challenge (ordinal)
+        address user;                                   // request initiator
+        uint256 createdAt;                              // timestamp of the request (uts)
+
+        string group;                                   // challenge payload component
+        uint32 resource;                                // challenge payload component
+
+        ChallengeData data;                             // Challenge progress data
+
+        uint8 flags;                                    // Extra state bit flags (like FLAG_ABUSE)
+        uint256 userEtherCost;                          // aggregated gas price user (creator of challenge) have spent.
+                                                        // May be compensated under circumstances on the next payout to user
     }
 
     // struct with dynamic data of the challenge
@@ -122,66 +143,67 @@ contract RewardToken is StandardToken {
         string error;                                   // in case of an error, hold description
         uint256 reward;                                 // amount of tokens assigned to sender as a result of the challenge
 
-        uint256 serviceCost;                       // approximate total gas charges BOTS spent on this request
+        uint256 serviceCost;                            // aggregated gas price bots (serving the contract) have spent managing the challenge
+                                                        // if serviceCostsEnabled, witheld as a commission from the user on payouts
     }
 
-    // Challenge is a request to bot(s) from a user
-    struct Challenge {
-        uint256 id;                                     // unique identifier of the challenge
-        address user;                                   // request owner
-        uint256 createdAt;                              // timestamp
+    address public ceo;                                 // contract owner, has special abillities:
+                                                        // modify array of authorized bots
+                                                        // directly reward users from bank funds
+                                                        // update rules array
 
-        string group;                                   // group designates the target of the challenge
-        uint32 resource;                                // specific request of challenge (part of the group)
+    mapping (address => bool) public bots;              // authorized bots which will respond to challenge requests and update their status/data
 
-        ChallengeData data;                             // struct with dynamic data of the challenge
+    mapping (address => uint256) public donations;      // amount of ether sent by every user.
+                                                        // this aggregated sum is only for informational purposes
+                                                        // and does not include ether send as part of token purchases
+                                                        // CEO investments (to bank) are also not included
 
-        uint8 flags;                                    // special state flags
-        uint256 userEtherCost;                          // gas cost per request of user (spent)
-    }
+    mapping (uint256 => Challenge) public challenges;   // Maps challenge ID to its data
 
-    address public ceo;                             // owner of contract, has the abillity to withdraw ether from the contract (if needed),
-                                                    // modify array of authorized bots
-                                                    // and update list of authorized groups
-    mapping (address => bool) public bots;          // authorized bots who can respond to challenge requests and update their status
-
-    string[] public groups;                             // authorized groups for future challenges
-
-    mapping (address => uint256) public donations;      // amount of ether sent by a user (excl. gas charges)
-
-    mapping (uint256 => Challenge) public challenges;   // Gets challenge by id
-
-    mapping (address => uint256) public userChallenge;  // active challenge id by user;
+    mapping (address => uint256) public userChallenge;  // Maps user address to his active challenge
                                                         // a user cannot have more than one ongoing challenge
 
     uint256 public numChallenges;                       // total number of created challenges
+                                                        // ID of next challenge
 
-    uint256 public totalOwnedTokens;                    // total number of tokens which are owne (not bank)
+    uint256 public totalOwnedTokens;                    // total number of tokens which have owners (not bank)
 
     uint256 public minBankForChallenge;                 // minimal amount of bank needed to start new challenges, as set by CEO
+                                                        // Used as safety check to deny challenges if contract is low on funds
 
-    uint256 public duration;                            // duration of a challenge, as set by the ceo
+    uint256 public duration;                            // duration of a challenge, as set by the CEO
 
     uint256[] public rules;                             // rewarding rules, as set by CEO
-                                                        // a sequence of threshold+rewardForPoint pairs used to calculate bonus;
+                                                        // a sequence of [ threshold, rewardForPoint ] pairs used to calculate bonus;
                                                         // the array MUST be sorted from higher to lower point threshold values
 
     uint public numberOfRules;                          // number of effective rules (pairs in rules array)
+                                                        // TODO: Why we don't use rules.length? Can this be removed?
 
-    uint256 public weiPerToken;                         // how much ether we give or take for a token, as set by CEO
+    uint256 public weiPerToken;                         // how much ether we give or take for token, as set by CEO.
+                                                        // Because weiPerToken can be changed and is not guaranteed, this will directly modify totalSupply
+                                                        // and user balances in ether equivalent
 
-    uint256 public requestTimeout;                      // maximum time before challenge is failed without confirmation or after confirmation
-                                                        // and a refund is available, as set by CEO
+    uint256 public requestTimeout;                      // maximum time before challenge is failed without confirmation or after confirmation+duration,
+                                                        // as set by CEO
 
     mapping (address => uint256) public serviceCost;    // for every user, keep storing aggregated amount of service costs
                                                         // to be witheld in the next Sell() transaction
+                                                        // Similar to Challenge.ServiceCost,
+                                                        // only includes assigned (confirmed) commission amount pending rating on payout transfer.
+                                                        // Do not include serviceCosts of challenges failed processing (if no abuse)
 
     bool public serviceCostsEnabled;                    // determines whether users will be charged for gas costs of service bots, as set by CEO
 
     mapping (address => uint256) public compensations;  // for every user, keep storing aggregated amount
                                                         // of gas price they spent on their transactions,
                                                         // specifically the part of which to be refunded to them
-                                                        // on the next sell() as compensation for service outage
+                                                        // on the next sell() as compensation for service outage.
+                                                        // Similar to ChallengeData.UserEtherCost,
+                                                        // only includes assigned (confirmed) compensation amount pending payout inclusion.
+                                                        // Do not include userEtherCost to compensation before challenge is over
+                                                        // (or if abuse flag is set when finished)
 
     /* Public variables of the token */
 
@@ -414,6 +436,9 @@ contract RewardToken is StandardToken {
         if (requestEther < 0) {
             revert("The balance is too low to add the service costs as commission (compensations excluded)");
         }
+
+        // TODO: This needs more review
+        assert(totalOwnedTokens >= requestTokens);
 
         balances[msg.sender] -= requestTokens;
         totalOwnedTokens -= requestTokens;
