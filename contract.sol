@@ -414,27 +414,26 @@ contract RewardToken is StandardToken {
             revert("You do not have enough tokens on your balance");
         }
 
-        int256 requestEther = int256(requestTokens * weiPerToken);
+        uint256 requestEther = requestTokens * weiPerToken;
 
         if (hasActiveChallenge(msg.sender)) {
             failChallengeIfTimeout(userChallenge[msg.sender]);
         }
 
         if(serviceCostsEnabled) {
-            requestEther -= int256(serviceCost[msg.sender]);
+            uint256 commission = serviceCost[msg.sender];
+            if (commission > requestEther) {
+                requestEther = 0;
+            }
         }
+
         serviceCost[msg.sender] = 0;
 
         // Only add compensations when possible
-        int256 compensationIncluded = int256(compensations[msg.sender]);
-        int256 maxEther = int256(address(this).balance);
-        if(requestEther + compensationIncluded <= maxEther) {
-            requestEther += compensationIncluded;
+        uint256 compensationIncluded = requestEther + compensations[msg.sender];
+        if(compensationIncluded <= address(this).balance) {
+            requestEther = compensationIncluded;
             compensations[msg.sender] = 0;
-        }
-
-        if (requestEther < 0) {
-            revert("The balance is too low to add the service costs as commission (compensations excluded)");
         }
 
         // TODO: This needs more review
@@ -443,7 +442,7 @@ contract RewardToken is StandardToken {
         balances[msg.sender] -= requestTokens;
         totalOwnedTokens -= requestTokens;
 
-        msg.sender.transfer(uint256(requestEther));
+        msg.sender.transfer(requestEther);
         emit Transfer(msg.sender, address(this), requestTokens);
     }
 
